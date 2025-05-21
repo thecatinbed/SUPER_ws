@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import rospy
 import math
+import threading
 from quadrotor_msgs.msg import PositionCommand
 from geometry_msgs.msg import Vector3
 from std_msgs.msg import Header
@@ -16,9 +17,11 @@ class TrajectoryPublisher:
         self.rate = rospy.Rate(20) 
         
         # 轨迹参数
-        self.start_time = rospy.Time.now()
-        self.trajectory_type = "circle"  # 可选项：circle, line, hover
-        
+        self.lock = threading.Lock()
+        with self.lock:  # 初始化时也加锁
+            self.start_time = rospy.Time.now()
+            self.trajectory_type = "waiting"  # 初始等待状态
+
         # 初始化消息
         self.cmd_msg = PositionCommand()
         self.cmd_msg.kx = [5.0, 5.0, 5.0]  # 位置增益
@@ -26,26 +29,72 @@ class TrajectoryPublisher:
         self.cmd_msg.trajectory_id = 1
         self.cmd_msg.trajectory_flag = 1
 
+        # 启动键盘监听线程
+        self.keyboard_thread = threading.Thread(target=self.keyboard_listener)
+        self.keyboard_thread.daemon = True
+        self.keyboard_thread.start()
+
+    def keyboard_listener(self):
+        """独立线程监听键盘输入"""
+        while not rospy.is_shutdown():
+            try:
+                user_input = input("\n请选择轨迹类型: \n"
+                                  "1 - 圆形轨迹\n"
+                                  "2 - 直线轨迹\n"
+                                  "3 - 定点 (0,0,3)\n"
+                                  "4 - 定点 (1,1,3)\n"
+                                  "输入选项 (1-4): ")
+                
+                with self.lock:
+                    if user_input == '1':
+                        self.trajectory_type = "circle"
+                        print("切换到圆形轨迹")
+                    elif user_input == '2':
+                        self.trajectory_type = "line"
+                        print("切换到直线轨迹")
+                    elif user_input == '3':
+                        self.trajectory_type = "hover_origin"
+                        print("切换到原点悬停")
+                    elif user_input == '4':
+                        self.trajectory_type = "hover_corner"
+                        print("切换到角落悬停")
+                    else:
+                        print("无效输入，请重新输入1-4")
+                        continue  # 跳过时间重置
+                    
+                    # 重置轨迹开始时间
+                    self.start_time = rospy.Time.now()
+                    
+            except Exception as e:
+                rospy.logerr(f"输入错误: {str(e)}")
+                break
+
     def generate_trajectory(self):
         """生成轨迹数据"""
-        t = (rospy.Time.now() - self.start_time).to_sec()
-        
-        if self.trajectory_type == "circle":
-            # 圆形轨迹 (半径2米，周期16秒)
+        with self.lock:
+            traj_type = self.trajectory_type
+            t = (rospy.Time.now() - self.start_time).to_sec()
+
+        if traj_type == "waiting":
+            # 初始等待状态不发布指令
+            return False
+        elif traj_type == "circle":
+            # 修正圆形轨迹公式 (半径2米，周期8秒)
             radius = 2.0
             omega = 2 * math.pi / 8
             
-            self.cmd_msg.position.x = radius * (math.cos(omega * t) - 1)
-            self.cmd_msg.position.y = radius * (math.sin(omega * t))
+            self.cmd_msg.position.x = radius * math.cos(omega * t)
+            self.cmd_msg.position.y = radius * math.sin(omega * t)
             self.cmd_msg.position.z = 3
             
-            self.cmd_msg.velocity.x = 0
-            self.cmd_msg.velocity.y = 0
+            self.cmd_msg.velocity.x = -radius * omega * math.sin(omega * t)
+            self.cmd_msg.velocity.y = radius * omega * math.cos(omega * t)
             self.cmd_msg.velocity.z = 0.0
             
             self.cmd_msg.yaw = 0
+            return True
             
-        elif self.trajectory_type == "line":
+        elif traj_type == "line":
             # 直线往复运动 (x轴方向)
             amplitude = 3.0
             period = 6.0
@@ -59,28 +108,38 @@ class TrajectoryPublisher:
             self.cmd_msg.velocity.z = 0.0
             
             self.cmd_msg.yaw = 0.0
+            return True
             
-        else:  # hover
-            # 悬停模式
+        elif traj_type == "hover_origin":
+            # 原点悬停 (0,0,3)
             self.cmd_msg.position.x = 0.0
             self.cmd_msg.position.y = 0.0
             self.cmd_msg.position.z = 3
             self.cmd_msg.velocity = Vector3(0,0,0)
             self.cmd_msg.yaw = 0.0
+            return True
+            
+        elif traj_type == "hover_corner":
+            # 角落悬停 (1,1,3)
+            self.cmd_msg.position.x = 1.0
+            self.cmd_msg.position.y = 1.0
+            self.cmd_msg.position.z = 3
+            self.cmd_msg.velocity = Vector3(0,0,0)
+            self.cmd_msg.yaw = 0.0
+            return True
 
     def run(self):
         while not rospy.is_shutdown():
-            # 更新header时间戳
-            self.cmd_msg.header = Header(
-                stamp=rospy.Time.now(),
-                frame_id="world"  # 坐标系名称
-            )
-            
             # 生成轨迹数据
-            self.generate_trajectory()
-            
-            # 发布消息
-            self.cmd_pub.publish(self.cmd_msg)
+            if self.generate_trajectory():
+                # 更新header时间戳
+                self.cmd_msg.header = Header(
+                    stamp=rospy.Time.now(),
+                    frame_id="world"
+                )
+                
+                # 发布消息
+                self.cmd_pub.publish(self.cmd_msg)
             
             # 维持发布频率
             self.rate.sleep()
@@ -88,6 +147,7 @@ class TrajectoryPublisher:
 if __name__ == '__main__':
     try:
         publisher = TrajectoryPublisher()
+        print("轨迹发布节点已启动，等待初始指令...")
         publisher.run()
     except rospy.ROSInterruptException:
         pass

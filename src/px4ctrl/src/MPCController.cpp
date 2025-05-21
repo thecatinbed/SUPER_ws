@@ -5,15 +5,16 @@ MPCController::MPCController() : solver_initialized_(false)
 {
 
     // 初始化参数
-    param_.horizon = 5;
-    param_.dt = 0.1;
+    param_.horizon = 10;
+    param_.dt = 0.01;
 
     // 设置权重矩阵
-    param_.Q_p = Eigen::Matrix<double, 3, 3>::Identity() * 1.0;
-    param_.Q_v = Eigen::Matrix<double, 3, 3>::Identity() * 0.0;
-    param_.R = Eigen::Matrix<double, 4, 4>::Identity() * 0.001;
-
-    param_.mass = 1.635;
+    param_.Q_p = Eigen::Matrix<double, 3, 3>::Identity() * 30;
+    param_.Q_p(2, 2) = 80;
+    param_.Q_v = Eigen::Matrix<double, 3, 3>::Identity() * 1;
+    param_.R = Eigen::Matrix<double, 4, 4>::Identity() * 5;
+    param_.R(0, 0) = 0.005;
+    param_.mass = 1.62;
     param_.gravity = 9.81;
     param_.thrust_limit = 30.0;
     // 初始化求解器
@@ -80,7 +81,7 @@ bool MPCController::estimateThrustModel(const Eigen::Vector3d &est_a,const Param
 
 void MPCController::resetThrustMapping(void)
 {
-    thr2acc_ = param_.gravity / 0.5;
+    thr2acc_ = param_.gravity / 0.65;
     P_ = 1e6;
 }
 
@@ -192,7 +193,7 @@ void MPCController::initializeSolver()
     casadi::SX U = casadi::SX::sym("U", 4, param_.horizon); // 控制序列
     casadi::SX X0 = casadi::SX::sym("X0", 6);               // 初始状态（参数）
     casadi::SX X_ref = casadi::SX::sym("X_ref", 6);         // 参考状态（参数）
-
+    casadi::SX thr2acc = casadi::SX::sym("thr2acc", 1);
     // 目标函数
     casadi::SX obj = 0;
 
@@ -225,9 +226,10 @@ void MPCController::initializeSolver()
         obj += casadi::SX::mtimes(e_p.T(), casadi::SX::mtimes(Q_p_casadi, e_p));
         obj += casadi::SX::mtimes(e_v.T(), casadi::SX::mtimes(Q_v_casadi, e_v));
         obj += casadi::SX::mtimes(u_k.T(), casadi::SX::mtimes(R_casadi, u_k));
+        obj += -u_k(0) * u_k(0) * R_casadi(0) + (u_k(0) - param_.mass * param_.gravity) * (u_k(0) - param_.mass * param_.gravity) * R_casadi(0);
 
         // 控制约束
-        g.push_back(u_k(0)); // 推力
+        g.push_back(u_k(0) / param_.mass / thr2acc); // 推力
         g.push_back(u_k(1)); // roll
         g.push_back(u_k(2)); // pitch
         g.push_back(u_k(3)); // yaw
@@ -243,7 +245,7 @@ void MPCController::initializeSolver()
     // 定义优化问题
     casadi::SXDict nlp = {
         {"x", casadi::SX::reshape(U, 4 * param_.horizon, 1)}, // 决策变量仅包含 U
-        {"p", casadi::SX::vertcat({X0, X_ref})},              // 参数
+        {"p", casadi::SX::vertcat({X0, X_ref, thr2acc})},              // 参数
         {"f", obj},
         {"g", casadi::SX::vertcat(g)}};
 
@@ -391,14 +393,16 @@ quadrotor_msgs::Px4ctrlDebug MPCController::calculateControl(const Desired_State
     Eigen::Matrix<double, 6, 1> ref_state;
     ref_state.segment(0, 3) = des.p; // 期望位置
     ref_state.segment(3, 3) = des.v; // 期望速度
-
+    casadi::DM thr2acc_dm = casadi::DM::zeros(1,1);
+    thr2acc_dm(0, 0) = thr2acc_;
     // 设置求解器输入
     casadi::DM p = casadi::DM::vertcat({casadi::DM::reshape(
                                             casadi::DM(std::vector<double>(state_.data(), state_.data() + state_.size())),
                                             state_.size(), 1),
                                         casadi::DM::reshape(
                                             casadi::DM(std::vector<double>(ref_state.data(), ref_state.data() + ref_state.size())),
-                                            ref_state.size(), 1)});
+                                            ref_state.size(), 1),
+                                        thr2acc_dm});
 
     // 求解优化问题
     casadi::DMDict arg = {{"p", p}};
@@ -410,8 +414,11 @@ quadrotor_msgs::Px4ctrlDebug MPCController::calculateControl(const Desired_State
     {
         // 控制约束
         // 推力范围
-        lbg.push_back(0.5 * param_.mass * param_.gravity);
-        ubg.push_back(param_.thrust_limit);
+        // lbg.push_back(0.5 * param_.mass * param_.gravity);
+        // ubg.push_back(param_.thrust_limit);
+
+        lbg.push_back(0.2);
+        ubg.push_back(0.8);
 
         // // 四元数约束
         // lbg.push_back(0);
@@ -428,7 +435,9 @@ quadrotor_msgs::Px4ctrlDebug MPCController::calculateControl(const Desired_State
 
     arg["lbg"] = lbg;
     arg["ubg"] = ubg;
-
+    // 调试输出
+    // std::cout << "实际参数维度: " << p.size1() << "x" << p.size2()
+    //           << " (期望值:13x1)" << std::endl;
     // 求解
     casadi::DMDict res = solver_(arg);
     casadi::DM U_opt = casadi::DM::reshape(res.at("x"), 4, param_.horizon);
@@ -444,9 +453,9 @@ quadrotor_msgs::Px4ctrlDebug MPCController::calculateControl(const Desired_State
                             * Eigen::AngleAxisd(u_opt(2), Eigen::Vector3d::UnitY()) 
                             * Eigen::AngleAxisd(u_opt(1), Eigen::Vector3d::UnitX());
     // 更新控制器输出
-    u.thrust = u_opt(0) / thr2acc_;
-    u.q = des_q;
-
+    u.thrust = u_opt(0) / param_.mass / thr2acc_;
+    u.q = imu.q * odom.q.inverse() * des_q;
+    // std::cout << "thrust:" << u.thrust << std::endl;
     // 填充调试信息
     // debug_msg_.des_p_x = des.p(0);
     // debug_msg_.des_p_y = des.p(1);

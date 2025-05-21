@@ -175,6 +175,7 @@ void PX4CtrlFSM::process()
 		{
 			set_hov_with_rc();
 			des = get_hover_des();
+			// std::cout << "des hover position:" << des.p << std::endl;
 			if ((rc_data.enter_command_mode) ||
 				(takeoff_land.delay_trigger.first && now_time > takeoff_land.delay_trigger.second))
 			{
@@ -432,7 +433,7 @@ Desired_State_t PX4CtrlFSM::get_rotor_speed_up_des(const ros::Time now)
 
 	Desired_State_t des;
 	des.p = takeoff_land.start_pose.head<3>();
-	des.v = Eigen::Vector3d::Zero();
+	des.v = Eigen::Vector3d(0, 0, 0.5);
 	des.a = Eigen::Vector3d(0, 0, des_a_z);
 	des.j = Eigen::Vector3d::Zero();
 	des.yaw = takeoff_land.start_pose(3);
